@@ -7,35 +7,33 @@ import streamlit as st
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docxcompose.composer import Composer
 
-# =========================
+# ======================================================
 # App Config
-# =========================
-st.set_page_config(page_title="SPC — Folder Order + TOC + Page Numbers", layout="wide")
-st.title("📚 SPC — Susun Ikut Folder (ZIP) + TOC + Muka Surat")
-st.caption("Gabung .docx ikut susunan folder dalam ZIP. TOC di awal, muka surat di footer. Tiada perubahan pada format kandungan setiap fail.")
+# ======================================================
+st.set_page_config(page_title="SPC — PDF-like Merge + TOC (Titles) + Page Numbers", layout="wide")
+st.title("📚 SPC — Gabung DOCX (PDF-like) + TOC Tajuk Paper + Muka Surat")
+st.caption("TOC di atas fail, tajuk ambil daripada Heading 1 setiap paper. Setiap dokumen di halaman baharu. Format asal setiap fail dikekalkan.")
 
-st.markdown(
-    """
+st.markdown("""
 **Cara guna ringkas**
-1) Upload satu **ZIP** yang mengandungi folder + fail **.docx**.  
-2) Klik **Gabungkan** → muat turun satu fail .docx gabungan.  
-3) Buka di Microsoft Word → **Right-click** pada TOC → **Update Field** → **Update entire table** (untuk paparan gaya laporan dengan dot leader & nombor muka surat kanan).
+1) Sediakan **ZIP** yang mengandungi semua `.docx` dalam folder.  
+2) Upload ZIP → klik **Gabungkan** → muat turun fail gabungan `.docx`.  
+3) Buka di Microsoft Word → **Right-click** pada TOC → **Update Field** → **Update entire table** (untuk kemas kini nombor halaman & rupa laporan dengan dot leaders).
 
-> **Nota TOC**: TOC bergantung pada **Heading 1/2/3** dalam dokumen asal. Tanpa heading, entri mungkin kosong.
-"""
-)
+> **Nota penting**: TOC guna **tajuk paper** daripada *Heading 1* dalam setiap dokumen. Jika tiada Heading 1, sistem akan guna **nama fail** sebagai tajuk.
+""")
 
-# =========================
+# ======================================================
 # Utilities
-# =========================
+# ======================================================
+
 def zip_docx_entries_in_order(zip_bytes: bytes):
     """
     Pulangkan senarai (name_in_zip, bytes) mengikut susunan entri dalam ZIP (ZipInfo order).
-    Hanya .docx diambil, folder diabaikan.
+    Hanya .docx diambil; folder diabaikan.
     """
     result = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -49,165 +47,211 @@ def zip_docx_entries_in_order(zip_bytes: bytes):
     return result  # kekalkan susunan asal dalam ZIP
 
 
-def add_toc_field(doc: Document, title="Table of Contents"):
+def extract_title_from_doc_bytes(doc_bytes: bytes, fallback_name: str) -> str:
     """
-    Sisip TOC di awal. Gaya visual 'laporan' (dot leader + nombor kanan) akan dipaparkan oleh Word
-    selepas pengguna 'Update Field'. Di sini kita sisip field standard TOC.
+    Cuba dapatkan tajuk daripada Heading 1 dalam dokumen.
+    Jika tiada, guna nama fail (tanpa .docx) sebagai fallback.
+    """
+    try:
+        d = Document(io.BytesIO(doc_bytes))
+        for p in d.paragraphs:
+            try:
+                if p.style and p.style.name and str(p.style.name).lower().startswith("heading 1"):
+                    txt = (p.text or "").strip()
+                    if txt:
+                        return txt
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # fallback: nama fail tanpa extension
+    base = os.path.splitext(os.path.basename(fallback_name))[0]
+    return base
+
+
+def add_field_run_hidden(paragraph, instr_text: str):
+    """
+    Sisip *complex field* yang disembunyikan (hidden/vanish) dalam satu paragraph.
+    Field code akan diset 'vanish' supaya tidak kelihatan pada paparan/print default.
+    """
+    # BEGIN
+    r_begin = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    vanish = OxmlElement("w:vanish")
+    rpr.append(vanish)
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    r_begin.append(rpr)
+    r_begin.append(fld_begin)
+    paragraph._p.append(r_begin)
+
+    # INSTR
+    r_instr = OxmlElement("w:r")
+    rpr2 = OxmlElement("w:rPr")
+    vanish2 = OxmlElement("w:vanish")
+    rpr2.append(vanish2)
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = f" {instr_text} "
+    r_instr.append(rpr2)
+    r_instr.append(instr)
+    paragraph._p.append(r_instr)
+
+    # END
+    r_end = OxmlElement("w:r")
+    rpr3 = OxmlElement("w:rPr")
+    vanish3 = OxmlElement("w:vanish")
+    rpr3.append(vanish3)
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    r_end.append(rpr3)
+    r_end.append(fld_end)
+    paragraph._p.append(r_end)
+
+
+def add_tc_hidden_entry(doc: Document, title: str, level: int = 1):
+    """
+    Tambah satu TC field tersembunyi (hidden) untuk TOC berdasarkan tajuk.
+    Contoh instruksi:  TC "My Paper Title" \l 1
+    """
+    p = doc.add_paragraph()  # paragraph kosong khusus untuk TC
+    safe_title = title.replace('"', "'")  # elak quote clash
+    instr = f'TC "{safe_title}" \\l {level}'
+    add_field_run_hidden(p, instr)
+
+
+def add_toc_field_from_tc(doc: Document, title="Table of Contents"):
+    """
+    Sisip TOC yang membaca entri dari TC fields: { TOC \h \z \f "TC" }.
+    Ini membolehkan kita kawal tajuk TOC ikut TC yang kita sisip (tajuk paper),
+    tanpa perlu mengubah kandungan dokumen asal.
     """
     # Tajuk TOC
-    title_para = doc.add_paragraph()
-    run = title_para.add_run(title)
+    t = doc.add_paragraph()
+    run = t.add_run(title)
     run.bold = True
-    run.font.size = Pt(16)
-    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # biar Word tentukan rupa; nombor kanan + dot leaders akan muncul selepas Update Field di Word
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # Medan TOC: { TOC \o "1-3" \h \z \u }
-    # \o "1-3" = Heading 1-3; \h = hyperlinked; \z = hide page numbers in web layout; \u = use applied outline levels
+    # Field TOC (berpunca dari TC fields)
     p = doc.add_paragraph()
-    fldSimple = OxmlElement('w:fldSimple')
-    fldSimple.set(qn('w:instr'), 'TOC \\o "1-3" \\h \\z \\u')
-    p._p.append(fldSimple)
+    fld = OxmlElement("w:fldSimple")
+    # \f "TC" => kumpul entri daripada TC fields
+    fld.set(qn("w:instr"), 'TOC \\h \\z \\f "TC"')
+    p._p.append(fld)
 
 
-def add_field_run(paragraph, field):
+def add_page_numbers_all_sections(doc: Document):
     """
-    Sisip Word field (cth. PAGE / NUMPAGES) ke dalam paragraph sedia ada.
+    Tambah 'Page X of Y' di footer (tengah) untuk semua seksyen dalam dokumen.
+    Dilakukan selepas gabungan supaya merangkumi seksyen daripada sub-documents.
     """
-    r = OxmlElement("w:r")
-    fldChar = OxmlElement("w:fldChar")
-    fldChar.set(qn("w:fldCharType"), "begin")
-    r.append(fldChar)
-    paragraph._p.append(r)
+    def add_field_run(paragraph, field):
+        r_begin = OxmlElement("w:r")
+        fld_begin = OxmlElement("w:fldChar")
+        fld_begin.set(qn("w:fldCharType"), "begin")
+        r_begin.append(fld_begin)
+        paragraph._p.append(r_begin)
 
-    r = OxmlElement("w:r")
-    instrText = OxmlElement("w:instrText")
-    instrText.set(qn("xml:space"), "preserve")
-    instrText.text = f" {field} "
-    r.append(instrText)
-    paragraph._p.append(r)
+        r_instr = OxmlElement("w:r")
+        instr = OxmlElement("w:instrText")
+        instr.set(qn("xml:space"), "preserve")
+        instr.text = f" {field} "
+        r_instr.append(instr)
+        paragraph._p.append(r_instr)
 
-    r = OxmlElement("w:r")
-    fldChar = OxmlElement("w:fldChar")
-    fldChar.set(qn("w:fldCharType"), "end")
-    r.append(fldChar)
-    paragraph._p.append(r)
+        r_end = OxmlElement("w:r")
+        fld_end = OxmlElement("w:fldChar")
+        fld_end.set(qn("w:fldCharType"), "end")
+        r_end.append(fld_end)
+        paragraph._p.append(r_end)
+
+    for section in doc.sections:
+        footer = section.footer
+        para = footer.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para.add_run("Page ")
+        add_field_run(para, "PAGE")
+        para.add_run(" of ")
+        add_field_run(para, "NUMPAGES")
 
 
-def add_page_numbers(doc: Document):
+def combine_pdf_like_with_toc_titles(zip_bytes: bytes) -> bytes:
     """
-    Tambah 'Page X of Y' di footer, penjajaran tengah.
+    Gabungkan dokumen .docx secara 'PDF-like' (setiap dokumen di halaman baharu),
+    TOC di awal berdasarkan **tajuk kertas** (Heading 1) via TC fields tersembunyi,
+    dan tambah muka surat untuk semua seksyen.
     """
-    section = doc.sections[0]
-    footer = section.footer
-    paragraph = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.add_run("Page ")
-    add_field_run(paragraph, "PAGE")
-    paragraph.add_run(" of ")
-    add_field_run(paragraph, "NUMPAGES")
-
-
-def combine_in_zip_order(zip_bytes: bytes) -> bytes:
-    """
-    Gabungkan dokumen mengikut susunan dalam ZIP.
-    - Letak TOC di awal
-    - Tambah muka surat (Page X of Y)
-    - Append setiap .docx terus (tanpa heading/page break tambahan)
-    """
-    base = Document()
-    add_toc_field(base, title="Table of Contents")
-    add_page_numbers(base)
-
-    composer = Composer(base)
-
     entries = zip_docx_entries_in_order(zip_bytes)
     if not entries:
         raise ValueError("ZIP tidak mengandungi sebarang .docx")
 
+    # Dokumen asas
+    base = Document()
+
+    # 1) Kumpul tajuk dan sisip TC fields (hidden) untuk setiap dokumen
+    titles = []
     for name, blob in entries:
+        title = extract_title_from_doc_bytes(blob, name)
+        titles.append(title)
+        add_tc_hidden_entry(base, title, level=1)
+
+    # 2) Sisip TOC di atas sekali, bersumberkan TC fields
+    add_toc_field_from_tc(base, title="Table of Contents")
+
+    # 3) Pisahkan TOC dari kandungan
+    base.add_page_break()
+
+    # 4) Gabungkan semua dokumen — setiap satu bermula di halaman baharu
+    composer = Composer(base)
+    for idx, (name, blob) in enumerate(entries):
+        if idx > 0:
+            base.add_page_break()  # pemisah halaman antara paper
         sub = Document(io.BytesIO(blob))
-        composer.append(sub)  # append as-is; tiada perubahan pada kandungan
+        composer.append(sub)
 
-    bio = io.BytesIO()
-    composer.save(bio)
-    bio.seek(0)
-    return bio.read()
+    # 5) Simpan sementara
+    tmp = io.BytesIO()
+    composer.save(tmp)
+    tmp.seek(0)
 
+    # 6) Tambah muka surat untuk semua seksyen pada fail komposit
+    compiled = Document(tmp)
+    add_page_numbers_all_sections(compiled)
 
-def make_sample_conference_zip(n_docs: int = 10) -> bytes:
-    """
-    Jana ZIP in-memory yang mengandungi n_docs fail .docx contoh
-    (tajuk Heading1, penulis Heading2, dan isi ringkas) untuk ujian cepat.
-    """
-    mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for i in range(1, n_docs + 1):
-            doc = Document()
-            # Heading untuk TOC
-            doc.add_heading(f"Extended Abstract Title {i}", level=1)
-            doc.add_heading(f"Author A{i}, Author B{i}", level=2)
-            doc.add_paragraph(
-                "Abstract:\n"
-                "This study investigates aspects of conference paper management. "
-                "It outlines methodology, results, and implications. "
-                "Future work will scale this preliminary study."
-            )
-            for j in range(3):
-                doc.add_paragraph(f"Section {j+1}: Detailed discussion for document {i}.")
+    out = io.BytesIO()
+    compiled.save(out)
+    out.seek(0)
+    return out.read()
 
-            # Simpan ke bytes lalu masuk ZIP
-            buf = io.BytesIO()
-            doc.save(buf)
-            buf.seek(0)
-            # Letak dalam folder 'papers/' untuk demo struktur folder
-            zf.writestr(f"papers/paper{i:02d}.docx", buf.read())
-    mem_zip.seek(0)
-    return mem_zip.read()
+# ======================================================
+# UI
+# ======================================================
 
-
-# =========================
-# UI — Sample Docs
-# =========================
-with st.expander("🧪 Jana & Muat Turun 10 Dokumen Contoh (Extended Abstract)"):
-    st.write(
-        "Klik butang di bawah untuk memuat turun ZIP contoh (mengandungi 10 fail .docx dalam folder `papers/`). "
-        "Fail contoh sudah ada Heading supaya TOC akan memaparkan entri."
-    )
-    if st.button("🔧 Jana ZIP Contoh (10 DOCX)"):
-        sample_zip = make_sample_conference_zip(10)
-        st.download_button(
-            "⬇️ Muat Turun ZIP Contoh",
-            data=sample_zip,
-            file_name="sample_conference_docs.zip",
-            mime="application/zip",
-        )
-
-# =========================
-# UI — Main Uploader
-# =========================
 st.subheader("Muat Naik ZIP Anda")
 zip_file = st.file_uploader(
-    "Upload satu ZIP (mengandungi folder + .docx). Susunan akan ikut susunan dalam ZIP.",
+    "Upload satu ZIP (mengandungi folder + .docx). Susunan ikut folder (ZipInfo order).",
     type=["zip"],
     accept_multiple_files=False
 )
 
-st.info("Disaran guna ZIP supaya susunan ikut folder adalah tepat. Jika perlu, guna ZIP contoh di atas untuk ujian.")
+st.info(
+    "• TOC menggunakan tajuk kertas daripada Heading 1 bagi setiap dokumen (fallback: nama fail). "
+    "Rupa laporan (tajuk kiri, nombor kanan, dot leaders) akan keluar selepas buka di Word dan Right-click TOC → Update Field → Update entire table.\n"
+    "• Setiap dokumen bermula di halaman baharu (tak bercampur). Kandungan asal tidak diubah."
+)
 
 default_name = f"SPC_Proceedings_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
 out_name = st.text_input("Nama fail output", value=default_name)
 
-# =========================
-# Action
-# =========================
-if st.button("🚀 Gabungkan Ikut Susunan Folder (ZIP)"):
+if st.button("🚀 Gabungkan (TOC tajuk paper, setiap dokumen halaman baharu)"):
     try:
         if not zip_file:
             st.warning("Sila upload satu fail ZIP.")
         else:
             with st.spinner("Menggabungkan dokumen ikut susunan folder dalam ZIP..."):
-                combined_bytes = combine_in_zip_order(zip_file.read())
-            st.success("Siap! Muat turun di bawah. (Di Microsoft Word, right-click TOC → Update Field → Update entire table)")
+                combined_bytes = combine_pdf_like_with_toc_titles(zip_file.read())
+            st.success("Siap! Muat turun di bawah. (Di Microsoft Word: Right-click TOC → Update Field → Update entire table)")
             st.download_button(
                 "⬇️ Muat Turun Fail Gabungan",
                 data=combined_bytes,
