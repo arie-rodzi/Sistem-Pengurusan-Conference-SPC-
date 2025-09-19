@@ -7,12 +7,13 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.section import WD_SECTION
+from docx.text.run import WD_BREAK          # <-- penting: PAGE break sebenar
 from docx.shared import Pt
 from docxcompose.composer import Composer
 
 st.set_page_config(page_title="SPC — Merge DOCX + TOC (TC fields)", layout="wide")
 st.title("📚 SPC — Merge DOCX (PDF-like) + TOC Tajuk & Nombor Halaman")
-st.caption("Upload ZIP atau banyak DOCX terus. TOC di atas (tanpa page number), dokumen pertama mula page 1 & bersambung.")
+st.caption("Upload ZIP atau banyak DOCX terus. TOC di atas (tanpa page number), dokumen pertama mula page 1 & bersambung. Setiap dokumen di halaman baharu.")
 
 # ----------------- Helpers -----------------
 
@@ -23,25 +24,22 @@ def files_from_zip(zip_bytes: bytes):
     out = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for info in zf.infolist():
-            if info.is_dir(): 
+            if info.is_dir():
                 continue
             name = info.filename
             if name.lower().endswith(".docx"):
                 with zf.open(info, "r") as fp:
                     out.append((name, fp.read()))
-    return out  # keep ZipInfo order (folder order)
+    return out  # ZipInfo order (ikut folder)
 
 def files_from_uploads(uploaded_files):
-    # Streamlit tak hantar struktur folder; kita guna nama fail & natural sort
     out = []
     for uf in uploaded_files:
         out.append((uf.name, uf.read()))
-    # natural sort utk ikut nombor di nama fail, kalau ada
-    out.sort(key=lambda x: natural_key(x[0]))
+    out.sort(key=lambda x: natural_key(x[0]))  # natural sort nama fail
     return out
 
 def extract_title_from_doc_bytes(doc_bytes: bytes, fallback_name: str) -> str:
-    # cuba ambil Heading 1 sebagai tajuk
     try:
         d = Document(io.BytesIO(doc_bytes))
         for p in d.paragraphs:
@@ -54,14 +52,11 @@ def extract_title_from_doc_bytes(doc_bytes: bytes, fallback_name: str) -> str:
     return os.path.splitext(os.path.basename(fallback_name))[0]
 
 def add_field_run(paragraph, field_code: str):
-    r1 = OxmlElement("w:r")
-    fc1 = OxmlElement("w:fldChar"); fc1.set(qn("w:fldCharType"), "begin")
+    r1 = OxmlElement("w:r"); fc1 = OxmlElement("w:fldChar"); fc1.set(qn("w:fldCharType"), "begin")
     r1.append(fc1); paragraph._p.append(r1)
-    r2 = OxmlElement("w:r")
-    it = OxmlElement("w:instrText"); it.set(qn("xml:space"), "preserve"); it.text = f" {field_code} "
+    r2 = OxmlElement("w:r"); it = OxmlElement("w:instrText"); it.set(qn("xml:space"), "preserve"); it.text = f" {field_code} "
     r2.append(it); paragraph._p.append(r2)
-    r3 = OxmlElement("w:r")
-    fc3 = OxmlElement("w:fldChar"); fc3.set(qn("w:fldCharType"), "end")
+    r3 = OxmlElement("w:r"); fc3 = OxmlElement("w:fldChar"); fc3.set(qn("w:fldCharType"), "end")
     r3.append(fc3); paragraph._p.append(r3)
 
 def add_hidden_tc_paragraph(doc: Document, title: str, level: int = 1):
@@ -103,7 +98,6 @@ def add_toc_from_tc_at_top(doc: Document):
     p._p.append(fld)
 
 def clear_pgnumtype_for_all_sections(doc: Document):
-    # buang tetapan restart page numbering pada semua seksyen
     for section in doc.sections:
         sectPr = section._sectPr
         pgNumType = sectPr.find(qn('w:pgNumType'))
@@ -122,7 +116,7 @@ def add_page_numbers_from_section(doc: Document, start_index: int = 1):
     Letak 'Page X of Y' pada footer seksyen pertama kandungan,
     seksyen berikutnya link ke previous. Seksyen 0 (TOC) tiada nombor.
     """
-    if len(doc.sections) == 0: 
+    if len(doc.sections) == 0:
         return
     # TOC section no number
     doc.sections[0].different_first_page_header_footer = True
@@ -139,7 +133,6 @@ def add_page_numbers_from_section(doc: Document, start_index: int = 1):
             doc.sections[i].different_first_page_header_footer = False
 
 def set_update_fields_on_open(doc: Document):
-    # auto-update fields (PAGE/NUMPAGES/TOC/TC) bila buka di Word
     settings = doc.settings.element
     upd = OxmlElement("w:updateFields"); upd.set(qn("w:val"), "true")
     settings.append(upd)
@@ -151,28 +144,28 @@ def combine_with_tc(files: list) -> bytes:
     files: list[(display_name, bytes)] — ikut susunan diberi
     Hasil:
       - Halaman 1: TOC (tanpa page number)
-      - Section break selepas TOC
-      - Setiap dokumen bermula halaman baharu
+      - SECTION BREAK selepas TOC
+      - **Setiap dokumen bermula HALAMAN BAHARU (PAGE BREAK sebenar)**
       - TC tersembunyi di awal setiap dokumen (tajuk untuk TOC)
       - Nombor muka surat bermula 1 pada dokumen pertama & sambung
     """
     if not files:
         raise ValueError("Tiada .docx diberikan")
 
-    # meta tajuk
     meta = [{"title": extract_title_from_doc_bytes(b, n), "blob": b} for n, b in files]
 
-    # 1) Base: TOC + SECTION BREAK
+    # 1) Base: TOC + SECTION BREAK (Next Page)
     base = Document()
     add_toc_from_tc_at_top(base)
-    base.add_section(WD_SECTION.NEW_PAGE)   # penting: seksyen kandungan berasingan
+    base.add_section(WD_SECTION.NEW_PAGE)   # seksyen kandungan asing dari TOC
 
     composer = Composer(base)
 
-    # 2) Untuk setiap paper: page break (kecuali yang pertama), TC tersembunyi, append subdoc
+    # 2) Untuk setiap paper: PAGE BREAK sebenar (kecuali paper pertama), TC tersembunyi, append subdoc
     for idx, item in enumerate(meta):
         if idx > 0:
-            base.add_paragraph().add_run().add_break()  # page break
+            br_para = base.add_paragraph()
+            br_para.add_run().add_break(WD_BREAK.PAGE)   # <-- PAGE break (bukan line break)
         add_hidden_tc_paragraph(base, item["title"], level=1)
         sub = Document(io.BytesIO(item["blob"]))
         composer.append(sub)
@@ -210,7 +203,7 @@ with col2:
         key="zip_docx",
     )
 
-st.caption("Tip: Jika perlu ikut struktur folder tepat, guna ZIP. Jika drag banyak fail sekaligus, app akan ikut susunan nama fail (natural sort).")
+st.caption("Tanpa ZIP, app ikut natural sort nama fail. Untuk ikut struktur folder tepat, guna ZIP.")
 
 default_name = f"SPC_Proceedings_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
 out_name = st.text_input("Nama fail output", value=default_name)
@@ -221,7 +214,6 @@ if st.button("🚀 Gabungkan"):
         if many_files:
             files = files_from_uploads(many_files)
         if one_zip is not None:
-            # gabung dgn ZIP kalau dua-dua diberi; ZIP ditambah di hujung
             files += files_from_zip(one_zip.read())
 
         if not files:
