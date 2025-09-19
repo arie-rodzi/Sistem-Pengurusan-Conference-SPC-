@@ -10,8 +10,8 @@ from docx.shared import Inches, Pt
 from docxcompose.composer import Composer
 
 st.set_page_config(page_title="SPC — Merge DOCX + Manual TOC", layout="wide")
-st.title("📚 SPC — Merge DOCX (PDF-like) + TOC Tajuk Kiri / Nombor Kanan + Muka Surat")
-st.caption("TOC manual tepat di atas. Setiap dokumen bermula halaman baharu. Kandungan asal tidak diubah.")
+st.title("📚 SPC — Merge DOCX (PDF-like) + TOC Tajuk Kiri / Nombor Kanan")
+st.caption("TOC manual di atas. Setiap dokumen bermula halaman baharu. TOC tiada nombor; nombor bermula 1 pada dokumen pertama. Kandungan asal tidak diubah.")
 
 # ================= helpers =================
 
@@ -55,13 +55,6 @@ def add_field_run(paragraph, field_code: str):
     fc3 = OxmlElement("w:fldChar"); fc3.set(qn("w:fldCharType"), "end")
     r3.append(fc3); paragraph._p.append(r3)
 
-def add_page_numbers_all_sections(doc: Document):
-    """Tambah 'Page X of Y' di footer (tengah) untuk semua seksyen."""
-    for section in doc.sections:
-        p = section.footer.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.add_run("Page "); add_field_run(p, "PAGE"); p.add_run(" of "); add_field_run(p, "NUMPAGES")
-
 def add_bookmark(paragraph, name: str):
     """Letak bookmark pada paragraph (untuk rujukan PAGEREF dalam TOC)."""
     start = OxmlElement("w:bookmarkStart"); start.set(qn("w:id"), "0"); start.set(qn("w:name"), name)
@@ -90,7 +83,6 @@ def add_manual_toc_at_top(doc: Document, toc_entries):
     if len(doc.paragraphs) == 0:
         doc.add_paragraph()
     title_para = doc.paragraphs[0]
-    # kosongkan dan set semula tajuk TOC
     title_para.clear()
     run = title_para.add_run("Table of Contents"); run.bold = True; run.font.size = Pt(14)
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -99,90 +91,3 @@ def add_manual_toc_at_top(doc: Document, toc_entries):
     sec = doc.sections[0]
     usable_width_emu = sec.page_width - sec.left_margin - sec.right_margin  # integer EMU
     usable_width_inch = usable_width_emu / 914400.0  # 1 inch = 914,400 EMU
-
-    # Sisip satu baris kosong SELEPAS tajuk sebagai sauh
-    anchor = _new_para_after(doc, title_para)
-
-    # Tambah setiap baris TOC tepat selepas anchor (berturutan)
-    last_para = anchor
-    for e in toc_entries:
-        p = _new_para_after(doc, last_para)
-        # Tab kanan pada had lebar kandungan; dot leaders
-        p.paragraph_format.tab_stops.add_tab_stop(
-            Inches(usable_width_inch), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS
-        )
-        p.add_run(e["title"])
-        p.add_run("\t")
-        add_field_run(p, f'PAGEREF {e["bookmark"]} \\h')
-        last_para = p
-
-# --------------- core merge ---------------
-
-def combine_with_manual_toc(zip_bytes: bytes) -> bytes:
-    files = zip_docx_entries_in_order(zip_bytes)
-    if not files:
-        raise ValueError("ZIP tidak mengandungi .docx")
-
-    # Sediakan senarai tajuk + bookmark
-    toc = []
-    for i, (name, blob) in enumerate(files, start=1):
-        title = extract_title_from_doc_bytes(blob, name)
-        toc.append({"title": title, "bookmark": f"DOC_{i}", "blob": blob})
-
-    # Dokumen asas: p0 akan menjadi tajuk TOC
-    base = Document()
-    base.add_paragraph()      # p0 = tajuk TOC
-    base.add_page_break()     # pisahkan TOC daripada kandungan
-
-    composer = Composer(base)
-    for i, item in enumerate(toc, start=1):
-        if i > 1:
-            base.add_page_break()  # setiap dokumen bermula halaman baharu
-        # paragraph untuk bookmark di permulaan dokumen i
-        bm_para = base.add_paragraph()
-        add_bookmark(bm_para, item["bookmark"])
-        # append sub-doc TANPA ubah format
-        sub = Document(io.BytesIO(item["blob"]))
-        composer.append(sub)
-
-    # Simpan gabungan sementara
-    buf = io.BytesIO(); composer.save(buf); buf.seek(0)
-
-    # Buka semula → sisip TOC manual di atas
-    doc = Document(buf)
-    add_manual_toc_at_top(doc, [{"title": x["title"], "bookmark": x["bookmark"]} for x in toc])
-    add_page_numbers_all_sections(doc)
-    set_update_fields_on_open(doc)
-
-    out = io.BytesIO(); doc.save(out); out.seek(0)
-    return out.read()
-
-# ================= UI =================
-
-st.subheader("Muat Naik ZIP Anda")
-zip_file = st.file_uploader(
-    "Upload satu ZIP (folder + .docx) — susunan ikut folder (ZipInfo order).",
-    type=["zip"], accept_multiple_files=False
-)
-
-st.info("TOC manual: tajuk kiri, nombor kanan (dot leaders). Sistem akan auto-refresh field bila buka di Word.")
-default_name = f"SPC_Proceedings_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
-out_name = st.text_input("Nama fail output", value=default_name)
-
-if st.button("🚀 Gabungkan (TOC manual + setiap dokumen halaman baharu)"):
-    try:
-        if not zip_file:
-            st.warning("Sila upload satu fail ZIP.")
-        else:
-            with st.spinner("Menggabungkan dokumen..."):
-                compiled = combine_with_manual_toc(zip_file.read())
-            st.success("Siap! Muat turun di bawah.")
-            st.download_button(
-                "⬇️ Muat Turun Fail Gabungan",
-                data=compiled,
-                file_name=out_name or "SPC_Proceedings.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-    except Exception as e:
-        st.error("Ralat semasa menggabungkan dokumen.")
-        st.exception(e)
